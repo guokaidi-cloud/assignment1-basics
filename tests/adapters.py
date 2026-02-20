@@ -9,6 +9,8 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+import numpy as np
+
 
 def run_linear(
     d_in: int,
@@ -415,7 +417,13 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    num_starts = len(dataset) - context_length
+    start_indices = np.random.randint(0, num_starts, size=(batch_size, 1))
+    offsets_x = np.arange(context_length)
+    offsets_y = np.arange(1, context_length + 1)
+    x = dataset[start_indices + offsets_x]
+    y = dataset[start_indices + offsets_y]
+    return torch.from_numpy(x).to(device), torch.from_numpy(y).to(device)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
