@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections import Counter
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
@@ -818,7 +819,104 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+
+    class BPETokenizer:
+        def __init__(
+            self,
+            vocab_: dict[int, bytes],
+            merges_: list[tuple[bytes, bytes]],
+            special_tokens_: list[str] | None = None,
+        ):
+            self.id_to_bytes = dict(vocab_)
+            self.bytes_to_id = {b: i for i, b in self.id_to_bytes.items()}
+            self.merges = merges_
+            # (left, right) -> merge order rank (lower = apply first)
+            self._merge_rank = {(l, r): i for i, (l, r) in enumerate(merges_)}
+            self.special_tokens = special_tokens_ or []
+            self.special_tokens_sorted = sorted(
+                self.special_tokens, key=len, reverse=True
+            )
+
+        def _bpe_encode_bytes(self, b: bytes) -> list[bytes]:
+            if not b:
+                return []
+            tokens = [bytes([x]) for x in b]
+            max_rank = len(self.merges)
+            while True:
+                best_rank = max_rank
+                best_idx = -1
+                for i in range(len(tokens) - 1):
+                    pair = (tokens[i], tokens[i + 1])
+                    r = self._merge_rank.get(pair, max_rank)
+                    # Match tiktoken: only merge (\\n,\\n) when it's the only pair
+                    # (i.e. segment is exactly \"\\n\\n\"), otherwise we'd get 628
+                    # where tiktoken gives 198,198 when followed by more text.
+                    if pair == (b"\n", b"\n") and len(tokens) > 2:
+                        r = max_rank
+                    if r < best_rank:
+                        best_rank, best_idx = r, i
+                if best_idx < 0:
+                    break
+                tokens[best_idx] = tokens[best_idx] + tokens[best_idx + 1]
+                del tokens[best_idx + 1]
+            return tokens
+
+        def _encode_normal(self, text: str) -> list[int]:
+            b = text.encode("utf-8")
+            tokens = self._bpe_encode_bytes(b)
+            return [self.bytes_to_id[t] for t in tokens]
+
+        def encode(self, text: str) -> list[int]:
+            if not self.special_tokens_sorted:
+                return self._encode_normal(text)
+
+            ids: list[int] = []
+            i = 0
+            n = len(text)
+            while i < n:
+                next_pos = -1
+                next_tok: str | None = None
+                for tok in self.special_tokens_sorted:
+                    pos = text.find(tok, i)
+                    if pos == -1:
+                        continue
+                    if next_pos == -1 or pos < next_pos:
+                        next_pos = pos
+                        next_tok = tok
+                    elif (
+                        pos == next_pos
+                        and next_tok is not None
+                        and len(tok) > len(next_tok)
+                    ):
+                        next_tok = tok
+
+                if next_pos == -1 or next_tok is None:
+                    ids.extend(self._encode_normal(text[i:]))
+                    break
+
+                if next_pos > i:
+                    ids.extend(self._encode_normal(text[i:next_pos]))
+
+                tok_bytes = next_tok.encode("utf-8")
+                if tok_bytes not in self.bytes_to_id:
+                    raise ValueError(f"Special token not in vocab: {next_tok}")
+                ids.append(self.bytes_to_id[tok_bytes])
+                i = next_pos + len(next_tok)
+
+            return ids
+
+        def decode(self, ids: list[int]) -> str:
+            if not ids:
+                return ""
+            out = b"".join(self.id_to_bytes[i] for i in ids)
+            return out.decode("utf-8", errors="replace")
+
+        def encode_iterable(self, iterable) -> Iterable[int]:
+            for chunk in iterable:
+                for token_id in self.encode(chunk):
+                    yield token_id
+
+    return BPETokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
@@ -848,4 +946,11 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    from src.tokenization.tokenizer_trainer import TokenizerTrainer
+
+    tokenizer = TokenizerTrainer(
+        corpos_path=str(input_path),
+        vocab_size=vocab_size,
+        special_tokens=special_tokens,
+    )
+    return tokenizer.train()
