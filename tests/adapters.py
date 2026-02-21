@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
@@ -591,7 +592,9 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+
+    log_probs = torch.log_softmax(inputs, dim=-1)
+    return -log_probs[torch.arange(inputs.shape[0], device=inputs.device), targets].mean()
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -603,14 +606,108 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    params = [p for p in parameters if p.grad is not None]
+    if not params:
+        return
+
+    total_sq_norm = torch.zeros(
+        (), device=params[0].grad.device, dtype=params[0].grad.dtype)
+    for p in params:
+        total_sq_norm = total_sq_norm + p.grad.pow(2).sum()
+    total_norm = torch.sqrt(total_sq_norm)
+
+    clip_coef = max_l2_norm / (total_norm + 1e-6)
+    if clip_coef < 1:
+        for p in params:
+            p.grad.mul_(clip_coef)
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    class AdamW(torch.optim.Optimizer):
+        def __init__(
+            self,
+            params,
+            lr: float = 1e-3,
+            betas: tuple[float, float] = (0.9, 0.999),
+            eps: float = 1e-8,
+            weight_decay: float = 1e-2,
+        ):
+            if lr < 0.0:
+                raise ValueError(f"Invalid learning rate: {lr}")
+            if eps < 0.0:
+                raise ValueError(f"Invalid epsilon value: {eps}")
+            if not 0.0 <= betas[0] < 1.0:
+                raise ValueError(
+                    f"Invalid beta parameter at index 0: {betas[0]}")
+            if not 0.0 <= betas[1] < 1.0:
+                raise ValueError(
+                    f"Invalid beta parameter at index 1: {betas[1]}")
+            if weight_decay < 0.0:
+                raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+
+            defaults = dict(lr=lr, betas=betas, eps=eps,
+                            weight_decay=weight_decay)
+            super().__init__(params, defaults)
+
+        @torch.no_grad()
+        def step(self, closure=None):
+            loss = None
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+
+            for group in self.param_groups:
+                lr = group["lr"]
+                beta1, beta2 = group["betas"]
+                eps = group["eps"]
+                weight_decay = group["weight_decay"]
+
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    grad = p.grad
+                    if grad.is_sparse:
+                        raise RuntimeError(
+                            "AdamW does not support sparse gradients")
+
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["step"] = 0
+                        state["exp_avg"] = torch.zeros_like(
+                            p, memory_format=torch.preserve_format)
+                        state["exp_avg_sq"] = torch.zeros_like(
+                            p, memory_format=torch.preserve_format)
+
+                    exp_avg = state["exp_avg"]
+                    exp_avg_sq = state["exp_avg_sq"]
+
+                    state["step"] += 1
+                    step = state["step"]
+
+                    # Decoupled weight decay (AdamW).
+                    if weight_decay != 0:
+                        p.mul_(1 - lr * weight_decay)
+
+                    # EMA updates.
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(
+                        grad, grad, value=1 - beta2)
+
+                    # Bias correction.
+                    bias_correction1 = 1 - beta1**step
+                    bias_correction2 = 1 - beta2**step
+                    step_size = lr / bias_correction1
+                    denom = exp_avg_sq.sqrt() / (bias_correction2**0.5)
+                    denom.add_(eps)
+
+                    p.addcdiv_(exp_avg, denom, value=-step_size)
+
+            return loss
+
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -638,7 +735,19 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    # Linear warmup: [0, warmup_iters]
+    if it < warmup_iters:
+        return max_learning_rate * (it / warmup_iters)
+
+    # Cosine decay: [warmup_iters, cosine_cycle_iters]
+    if it <= cosine_cycle_iters:
+        decay_progress = (it - warmup_iters) / \
+            (cosine_cycle_iters - warmup_iters)
+        cosine_value = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+        return min_learning_rate + (max_learning_rate - min_learning_rate) * cosine_value
+
+    # Keep minimum lr after cosine finishes.
+    return min_learning_rate
 
 
 def run_save_checkpoint(
@@ -657,7 +766,12 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "iteration": iteration,
+    }
+    torch.save(checkpoint, out)
 
 
 def run_load_checkpoint(
@@ -678,7 +792,10 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    checkpoint = torch.load(src, map_location="cpu")
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    return int(checkpoint["iteration"])
 
 
 def get_tokenizer(
