@@ -22,16 +22,15 @@ def run_linear(
     Given the weights of a Linear layer, compute the transformation of a batched input.
 
     Args:
-        in_dim (int): The size of the input dimension
-        out_dim (int): The size of the output dimension
+        d_in (int): The size of the input dimension
+        d_out (int): The size of the output dimension
         weights (Float[Tensor, "d_out d_in"]): The linear weights to use
-        in_features (Float[Tensor, "... d_in"]): The output tensor to apply the function to
+        in_features (Float[Tensor, "... d_in"]): The input tensor to apply the transformation to
 
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    return in_features @ weights.T
 
 
 def run_embedding(
@@ -52,8 +51,7 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    return weights[token_ids]
 
 
 def run_swiglu(
@@ -85,7 +83,11 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+
+    # SwiGLU(x) = (SiLU(x @ W1.T) * (x @ W3.T)) @ W2.T
+    gate = torch.nn.functional.silu(in_features @ w1_weight.T)
+    up = in_features @ w3_weight.T
+    return (gate * up) @ w2_weight.T
 
 
 def run_scaled_dot_product_attention(
@@ -106,7 +108,12 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    d_k = Q.size(-1)
+    scores = (Q @ K.transpose(-2, -1)) / (d_k ** 0.5)
+    if mask is not None:
+        scores = scores.masked_fill(~mask, float("-inf"))
+    attn = torch.softmax(scores, dim=-1)
+    return attn @ V
 
 
 def run_multihead_self_attention(
@@ -140,7 +147,21 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    d_k = d_model // num_heads
+    # Linear output (batch, seq, d_model); doc says concat heads along dim0 so rows are [head0_d0..head0_dk, head1_d0..], view as (..., num_heads, d_k)
+    Q = (in_features @ q_proj_weight.T).view(*
+                                             in_features.shape[:-1], num_heads, d_k).transpose(-3, -2)
+    K = (in_features @ k_proj_weight.T).view(*
+                                             in_features.shape[:-1], num_heads, d_k).transpose(-3, -2)
+    V = (in_features @ v_proj_weight.T).view(*
+                                             in_features.shape[:-1], num_heads, d_k).transpose(-3, -2)
+    attn_out = run_scaled_dot_product_attention(Q, K, V, mask=None)
+    # (..., num_heads, seq, d_k) -> (..., seq, num_heads, d_k) -> (..., seq, d_k, num_heads) -> (..., seq, d_model)
+    # Ref uses dimension-first concat: [dim0_h0, dim0_h1, dim0_h2, dim0_h3, dim1_h0, ...]
+    attn_out = attn_out.transpose(-3, -2).transpose(-2, -1).contiguous()
+    s = attn_out.shape
+    attn_out = attn_out.reshape(*s[:-2], s[-2] * s[-1])
+    return attn_out @ o_proj_weight.T
 
 
 def run_multihead_self_attention_with_rope(
@@ -180,7 +201,33 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    d_k = d_model // num_heads
+    Q = (in_features @ q_proj_weight.T).view(
+        *in_features.shape[:-1], num_heads, d_k
+    ).transpose(-3, -2)
+    K = (in_features @ k_proj_weight.T).view(
+        *in_features.shape[:-1], num_heads, d_k
+    ).transpose(-3, -2)
+    V = (in_features @ v_proj_weight.T).view(
+        *in_features.shape[:-1], num_heads, d_k
+    ).transpose(-3, -2)
+    seq_len = Q.size(-2)
+    if token_positions is None:
+        token_positions = torch.arange(
+            seq_len, device=Q.device, dtype=torch.long
+        )
+        while token_positions.dim() < Q.dim() - 1:
+            token_positions = token_positions.unsqueeze(0)
+        token_positions = token_positions.expand(
+            *Q.shape[:-2], seq_len
+        )
+    Q = run_rope(d_k, theta, max_seq_len, Q, token_positions)
+    K = run_rope(d_k, theta, max_seq_len, K, token_positions)
+    attn_out = run_scaled_dot_product_attention(Q, K, V, mask=None)
+    attn_out = attn_out.transpose(-3, -2).transpose(-2, -1).contiguous()
+    s = attn_out.shape
+    attn_out = attn_out.reshape(*s[:-2], s[-2] * s[-1])
+    return attn_out @ o_proj_weight.T
 
 
 def run_rope(
@@ -202,7 +249,24 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    device = in_query_or_key.device
+    dtype = in_query_or_key.dtype
+    # inv_freq[i] = theta^(-2i/d_k) for pair i; use 1/(theta^(...)) for numerical stability
+    inv_freq = 1.0 / (
+        theta ** (torch.arange(0, d_k, 2, device=device,
+                  dtype=torch.float64) / d_k)
+    ).to(dtype)
+    pos = token_positions.unsqueeze(-1).to(dtype)
+    freqs = pos * inv_freq
+    emb = torch.cat([freqs, freqs], dim=-1)
+    cos = emb.cos().to(dtype)
+    sin = emb.sin().to(dtype)
+    x1 = in_query_or_key[..., 0::2]
+    x2 = in_query_or_key[..., 1::2]
+    out = torch.empty_like(in_query_or_key)
+    out[..., 0::2] = x1 * cos[..., 0::2] - x2 * sin[..., 0::2]
+    out[..., 1::2] = x1 * sin[..., 0::2] + x2 * cos[..., 0::2]
+    return out
 
 
 def run_transformer_block(
