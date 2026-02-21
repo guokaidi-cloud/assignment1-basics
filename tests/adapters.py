@@ -85,7 +85,7 @@ def run_swiglu(
     # swiglu.w3.weight.data = w3_weight
 
     # SwiGLU(x) = (SiLU(x @ W1.T) * (x @ W3.T)) @ W2.T
-    gate = torch.nn.functional.silu(in_features @ w1_weight.T)
+    gate = run_silu(in_features @ w1_weight.T)
     up = in_features @ w3_weight.T
     return (gate * up) @ w2_weight.T
 
@@ -112,7 +112,7 @@ def run_scaled_dot_product_attention(
     scores = (Q @ K.transpose(-2, -1)) / (d_k ** 0.5)
     if mask is not None:
         scores = scores.masked_fill(~mask, float("-inf"))
-    attn = torch.softmax(scores, dim=-1)
+    attn = run_softmax(scores, dim=-1)
     return attn @ V
 
 
@@ -457,7 +457,37 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    eps = 1e-5
+
+    # Token embedding lookup.
+    x = run_embedding(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        weights=weights["token_embeddings.weight"],
+        token_ids=in_indices,
+    )
+
+    # Stack pre-norm transformer blocks.
+    for layer_idx in range(num_layers):
+        layer_weights = {
+            k.replace(f"layers.{layer_idx}.", ""): v
+            for k, v in weights.items()
+            if k.startswith(f"layers.{layer_idx}.")
+        }
+        x = run_transformer_block(
+            d_model=d_model,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            max_seq_len=context_length,
+            theta=rope_theta,
+            weights=layer_weights,
+            in_features=x,
+        )
+
+    # Final RMSNorm + LM head projection to vocabulary logits.
+    x = run_rmsnorm(d_model=d_model, eps=eps,
+                    weights=weights["ln_final.weight"], in_features=x)
+    return x @ weights["lm_head.weight"].T
 
 
 def run_rmsnorm(
@@ -495,7 +525,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return in_features * torch.nn.functional.sigmoid(in_features)
 
 
 def run_get_batch(
@@ -540,7 +570,10 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+
+    shifted = in_features - in_features.max(dim=dim, keepdim=True).values
+    exp_shifted = torch.exp(shifted)
+    return exp_shifted / exp_shifted.sum(dim=dim, keepdim=True)
 
 
 def run_cross_entropy(
