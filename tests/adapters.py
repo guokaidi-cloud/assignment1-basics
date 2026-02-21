@@ -148,19 +148,26 @@ def run_multihead_self_attention(
         implementation with the given QKV projection weights and input features.
     """
     d_k = d_model // num_heads
-    # Linear output (batch, seq, d_model); doc says concat heads along dim0 so rows are [head0_d0..head0_dk, head1_d0..], view as (..., num_heads, d_k)
-    Q = (in_features @ q_proj_weight.T).view(*
-                                             in_features.shape[:-1], num_heads, d_k).transpose(-3, -2)
-    K = (in_features @ k_proj_weight.T).view(*
-                                             in_features.shape[:-1], num_heads, d_k).transpose(-3, -2)
-    V = (in_features @ v_proj_weight.T).view(*
-                                             in_features.shape[:-1], num_heads, d_k).transpose(-3, -2)
-    attn_out = run_scaled_dot_product_attention(Q, K, V, mask=None)
-    # (..., num_heads, seq, d_k) -> (..., seq, num_heads, d_k) -> (..., seq, d_k, num_heads) -> (..., seq, d_model)
-    # Ref uses dimension-first concat: [dim0_h0, dim0_h1, dim0_h2, dim0_h3, dim1_h0, ...]
-    attn_out = attn_out.transpose(-3, -2).transpose(-2, -1).contiguous()
-    s = attn_out.shape
-    attn_out = attn_out.reshape(*s[:-2], s[-2] * s[-1])
+    seq_len = in_features.shape[-2]
+
+    q = (in_features @ q_proj_weight.T).view(
+        *in_features.shape[:-1], num_heads, d_k
+    ).transpose(-3, -2)
+    k = (in_features @ k_proj_weight.T).view(
+        *in_features.shape[:-1], num_heads, d_k
+    ).transpose(-3, -2)
+    v = (in_features @ v_proj_weight.T).view(
+        *in_features.shape[:-1], num_heads, d_k
+    ).transpose(-3, -2)
+
+    causal_mask = torch.tril(
+        torch.ones(seq_len, seq_len,
+                   device=in_features.device, dtype=torch.bool)
+    )
+    attn_out = run_scaled_dot_product_attention(q, k, v, mask=causal_mask)
+    attn_out = attn_out.transpose(-3, -2).contiguous().reshape(
+        *in_features.shape[:-2], seq_len, d_model
+    )
     return attn_out @ o_proj_weight.T
 
 
@@ -202,31 +209,33 @@ def run_multihead_self_attention_with_rope(
         implementation with the given QKV projection weights and input features.
     """
     d_k = d_model // num_heads
-    Q = (in_features @ q_proj_weight.T).view(
+    seq_len = in_features.shape[-2]
+
+    q = (in_features @ q_proj_weight.T).view(
         *in_features.shape[:-1], num_heads, d_k
     ).transpose(-3, -2)
-    K = (in_features @ k_proj_weight.T).view(
+    k = (in_features @ k_proj_weight.T).view(
         *in_features.shape[:-1], num_heads, d_k
     ).transpose(-3, -2)
-    V = (in_features @ v_proj_weight.T).view(
+    v = (in_features @ v_proj_weight.T).view(
         *in_features.shape[:-1], num_heads, d_k
     ).transpose(-3, -2)
-    seq_len = Q.size(-2)
+
     if token_positions is None:
         token_positions = torch.arange(
-            seq_len, device=Q.device, dtype=torch.long
-        )
-        while token_positions.dim() < Q.dim() - 1:
-            token_positions = token_positions.unsqueeze(0)
-        token_positions = token_positions.expand(
-            *Q.shape[:-2], seq_len
-        )
-    Q = run_rope(d_k, theta, max_seq_len, Q, token_positions)
-    K = run_rope(d_k, theta, max_seq_len, K, token_positions)
-    attn_out = run_scaled_dot_product_attention(Q, K, V, mask=None)
-    attn_out = attn_out.transpose(-3, -2).transpose(-2, -1).contiguous()
-    s = attn_out.shape
-    attn_out = attn_out.reshape(*s[:-2], s[-2] * s[-1])
+            seq_len, device=in_features.device, dtype=torch.long)
+
+    q = run_rope(d_k, theta, max_seq_len, q, token_positions)
+    k = run_rope(d_k, theta, max_seq_len, k, token_positions)
+
+    causal_mask = torch.tril(
+        torch.ones(seq_len, seq_len,
+                   device=in_features.device, dtype=torch.bool)
+    )
+    attn_out = run_scaled_dot_product_attention(q, k, v, mask=causal_mask)
+    attn_out = attn_out.transpose(-3, -2).contiguous().reshape(
+        *in_features.shape[:-2], seq_len, d_model
+    )
     return attn_out @ o_proj_weight.T
 
 
@@ -251,21 +260,20 @@ def run_rope(
     """
     device = in_query_or_key.device
     dtype = in_query_or_key.dtype
-    # inv_freq[i] = theta^(-2i/d_k) for pair i; use 1/(theta^(...)) for numerical stability
     inv_freq = 1.0 / (
         theta ** (torch.arange(0, d_k, 2, device=device,
                   dtype=torch.float64) / d_k)
     ).to(dtype)
     pos = token_positions.unsqueeze(-1).to(dtype)
-    freqs = pos * inv_freq
-    emb = torch.cat([freqs, freqs], dim=-1)
-    cos = emb.cos().to(dtype)
-    sin = emb.sin().to(dtype)
-    x1 = in_query_or_key[..., 0::2]
-    x2 = in_query_or_key[..., 1::2]
+    freqs = pos * inv_freq  # (..., sequence_length, d_k / 2)
+    cos = freqs.cos().to(dtype)
+    sin = freqs.sin().to(dtype)
+
+    x_even = in_query_or_key[..., 0::2]
+    x_odd = in_query_or_key[..., 1::2]
     out = torch.empty_like(in_query_or_key)
-    out[..., 0::2] = x1 * cos[..., 0::2] - x2 * sin[..., 0::2]
-    out[..., 1::2] = x1 * sin[..., 0::2] + x2 * cos[..., 0::2]
+    out[..., 0::2] = x_even * cos - x_odd * sin
+    out[..., 1::2] = x_even * sin + x_odd * cos
     return out
 
 
@@ -339,7 +347,35 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    eps = 1e-5
+
+    # Pre-norm attention block: x + MHA(RMSNorm(x))
+    x_norm = run_rmsnorm(d_model, eps, weights["ln1.weight"], in_features)
+    attn_out = run_multihead_self_attention_with_rope(
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len,
+        theta=theta,
+        q_proj_weight=weights["attn.q_proj.weight"],
+        k_proj_weight=weights["attn.k_proj.weight"],
+        v_proj_weight=weights["attn.v_proj.weight"],
+        o_proj_weight=weights["attn.output_proj.weight"],
+        in_features=x_norm,
+        token_positions=None,
+    )
+    x = in_features + attn_out
+
+    # Pre-norm FFN block: x + SwiGLU(RMSNorm(x))
+    x_ffn_norm = run_rmsnorm(d_model, eps, weights["ln2.weight"], x)
+    ffn_out = run_swiglu(
+        d_model=d_model,
+        d_ff=d_ff,
+        w1_weight=weights["ffn.w1.weight"],
+        w2_weight=weights["ffn.w2.weight"],
+        w3_weight=weights["ffn.w3.weight"],
+        in_features=x_ffn_norm,
+    )
+    return x + ffn_out
 
 
 def run_transformer_lm(
@@ -444,7 +480,8 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+
+    return in_features * torch.rsqrt(in_features.pow(2).mean(dim=-1, keepdim=True) + eps) * weights
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
